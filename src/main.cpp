@@ -19,6 +19,7 @@ const int CSPin = 5;
 const int sampleRate = 40000;
 const int bufferSize = 1024;
 bool recording = false;
+bool playing = false; // New flag for playback
 
 // Wi-Fi credentials
 const char* ssid = "ErstHausaufgabenMachen";
@@ -32,10 +33,10 @@ unsigned long lastDebounceTime = 0;
 const unsigned long debounceDelay = 30;
 
 unsigned long recordLedOnTime = 0;
-const unsigned long recordLedTimeout = 10000; // 10 seconds
+const unsigned long recordLedTimeout = 5000; // 10 seconds
 
 unsigned long playLedOnTime = 0;
-const unsigned long playLedTimeout = 10000; // 10 seconds
+const unsigned long playLedTimeout = 5000; // 10 seconds
 
 // Record LED variables
 int recordLedState = LOW;
@@ -51,13 +52,11 @@ bool playModeActive = false;
 
 // Function declarations
 void readerTask(void *param);
+void playerTask(void *param);
 void setupServer();
 
-// ADC and I2S configuration
-#define DEFAULT_VREF 1100
-esp_adc_cal_characteristics_t *adc_chars;
-
-i2s_config_t i2s_config = {
+// ADC and I2S configuration for recording
+i2s_config_t i2s_config_record = {
   .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX | I2S_MODE_ADC_BUILT_IN),
   .sample_rate = sampleRate,
   .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
@@ -69,6 +68,29 @@ i2s_config_t i2s_config = {
   .use_apll = false,
   .tx_desc_auto_clear = false,
   .fixed_mclk = 0
+};
+
+// I2S configuration for playback
+i2s_config_t i2s_config_playback = {
+  .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
+  .sample_rate = sampleRate,
+  .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+  .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+  .communication_format = I2S_COMM_FORMAT_I2S_LSB,
+  .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+  .dma_buf_count = 4,
+  .dma_buf_len = bufferSize,
+  .use_apll = true, // Use APLL (Automatic Precision Level Lock) for clock generation
+  .tx_desc_auto_clear = false,
+  .fixed_mclk = 0
+};
+
+// I2S pin configuration for playback
+i2s_pin_config_t pin_config = {
+  .bck_io_num = I2S_PIN_NO_CHANGE,  // No separate clock pin needed
+  .ws_io_num = I2S_PIN_NO_CHANGE,   // No separate word select pin needed
+  .data_out_num = 16,               // Data output pin (SIG)
+  .data_in_num = I2S_PIN_NO_CHANGE  // Not used in playback
 };
 
 void setup() {
@@ -103,14 +125,14 @@ void setup() {
   // Start the server
   setupServer();
 
-  // Install and start I2S driver with error check
-  esp_err_t i2s_err = i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
+  // Install and start I2S driver for recording
+  esp_err_t i2s_err = i2s_driver_install(I2S_NUM_0, &i2s_config_record, 0, NULL);
   if (i2s_err != ESP_OK) {
-    Serial.printf("I2S driver install failed: %d\n", i2s_err);
+    Serial.printf("I2S driver install failed for recording: %d\n", i2s_err);
     return;
   }
 
-  // Set I2S ADC mode
+  // Set I2S ADC mode for recording
   i2s_set_adc_mode(ADC_UNIT_1, ADC1_CHANNEL_7);
   i2s_adc_enable(I2S_NUM_0);
 
@@ -206,7 +228,22 @@ void loop() {
           playModeActive = true;
           recordModeActive = false; // Ensure record mode is not active
           digitalWrite(recordRedLEDPin, LOW); // Turn off record LED
-
+          
+          playing = !playing;
+          if (playing) {
+            Serial.println("Playback started...");
+            if (xTaskCreatePinnedToCore(playerTask, "Player Task", 12288, NULL, 1, NULL, 0) != pdPASS) {
+              Serial.println("Failed to create player task");
+              playing = false; // Ensure it doesn't get stuck
+              playLedState = LOW;
+              digitalWrite(playBlueLEDPin, playLedState);
+            }
+          } else {
+            Serial.println("Playback stopped.");
+            delay(1000);
+            playLedState = LOW;
+            digitalWrite(playBlueLEDPin, playLedState);
+          }
         }
       }
     }
@@ -222,6 +259,7 @@ void loop() {
 
     // Reset play mode
     playModeActive = false;
+    playing = false;
   }
 
   lastPlayButtonState = playReading;  // Save current play button state
@@ -320,6 +358,62 @@ void readerTask(void *param) {
 
   audioFile.close();
   Serial.println("Recording stopped, file closed");
+  vTaskDelete(NULL);
+}
+
+void playerTask(void *param) {
+  Serial.println("Player task started");
+
+  // Uninstall I2S driver if it is already installed
+  i2s_driver_uninstall(I2S_NUM_0);
+
+  // Install and start I2S driver for playback
+  esp_err_t i2s_err = i2s_driver_install(I2S_NUM_0, &i2s_config_playback, 0, NULL);
+  if (i2s_err != ESP_OK) {
+    Serial.printf("I2S driver install failed for playback: %d\n", i2s_err);
+    vTaskDelete(NULL);
+    return;
+  }
+
+  // Set I2S pin configuration
+  i2s_err = i2s_set_pin(I2S_NUM_0, &pin_config);
+  if (i2s_err != ESP_OK) {
+    Serial.printf("I2S set pin failed: %d\n", i2s_err);
+    vTaskDelete(NULL);
+    return;
+  }
+
+  i2s_zero_dma_buffer(I2S_NUM_0);
+
+  File audioFile = SD.open("/recording.wav", FILE_READ);
+  if (!audioFile) {
+    Serial.println("Failed to open file for reading on SD card");
+    vTaskDelete(NULL);
+    return;
+  }
+
+  Serial.println("File opened successfully for reading");
+
+  audioFile.seek(44); // Skip WAV header
+
+  while (playing) {
+    int16_t buffer[bufferSize];
+    size_t bytesRead = audioFile.read((uint8_t *)buffer, sizeof(buffer));
+    if (bytesRead == 0) {
+      Serial.println("End of file reached");
+      break;
+    }
+
+    size_t bytesWritten;
+    esp_err_t i2s_err = i2s_write(I2S_NUM_0, (char *)buffer, bytesRead, &bytesWritten, portMAX_DELAY);
+    if (i2s_err != ESP_OK) {
+      Serial.printf("I2S write failed: %d\n", i2s_err);
+      break;
+    }
+  }
+
+  audioFile.close();
+  Serial.println("Playback stopped, file closed");
   vTaskDelete(NULL);
 }
 
