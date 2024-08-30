@@ -1,428 +1,467 @@
 #include <Arduino.h>
 #include <WiFi.h>
-#include <ESPAsyncWebServer.h>
-#include <driver/i2s.h>
-#include <FS.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 #include <SD.h>
-#include <SPI.h>
-#include <esp_adc_cal.h>
+#include <FS.h>
+#include <driver/i2s.h>
+#include <driver/adc.h>
 
 // Pin definitions
-const int recordRedLEDPin = 33;        // Record LED pin
-const int recordRedButtonPin = 32;     // Record button pin
-
-const int playBlueLEDPin = 22;         // Play LED pin
-const int playBlueButtonPin = 21;      // Play button pin
-
-const int CSPin = 5;
-
-const int sampleRate = 40000;
-const int bufferSize = 1024;
-bool recording = false;
-bool playing = false; // New flag for playback
+const int recordRedLEDPin = 33;     // Record LED pin
+const int recordRedButtonPin = 32;  // Record button pin
+const int playBlueLEDPin = 22;      // Play LED pin
+const int playBlueButtonPin = 21;   // Play button pin
+const int CSPin = 5;                // Chip select pin for the SD card module
 
 // Wi-Fi credentials
-const char* ssid = "ErstHausaufgabenMachen";
-const char* password = "baf.09021c0129";
+const char *ssid = "FRITZ!Box 7590 YH"; // Replace with your Wi-Fi SSID
+const char *password = "85050155753107747314"; // Replace with your Wi-Fi password
 
-// Server setup
-AsyncWebServer server(80);
+// ngrok static domain
+const String serverURL = "https://8ea3035bbf6b75532a241ec23480c4ee.serveo.net";  // Replace with your static Serveo URL
 
-// Debounce and timer variables
-unsigned long lastDebounceTime = 0;
-const unsigned long debounceDelay = 30;
+// Audio settings
+const int sampleRate = 44100;
+const int bufferSize = 1024;
+const int bitsPerSample = 16;
+const int channels = 1; // Mono
 
-unsigned long recordLedOnTime = 0;
-const unsigned long recordLedTimeout = 5000; // 10 seconds
+// File management
+const String recordedFilePath = "/uploaded_audio_device1.wav";
+const String downloadedFilePath = "/uploaded_audio_device2.wav";
+const String checkFileURL = "/check/device2"; // Endpoint to check for new audio files from device2
 
-unsigned long playLedOnTime = 0;
-const unsigned long playLedTimeout = 5000; // 10 seconds
+// I2S configurations for recording
+i2s_config_t i2s_config_record = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+    .sample_rate = sampleRate,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .communication_format = I2S_COMM_FORMAT_I2S_LSB,
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count = 4,
+    .dma_buf_len = bufferSize,
+    .use_apll = false,
+    .tx_desc_auto_clear = false,
+    .fixed_mclk = 0
+};
 
-// Record LED variables
-int recordLedState = LOW;
-int recordButtonState;
-int lastRecordButtonState = HIGH;
-bool recordModeActive = false;
+i2s_pin_config_t pin_config_record = {
+    .bck_io_num = I2S_PIN_NO_CHANGE,    // Bit clock pin for microphone (input)
+    .ws_io_num = I2S_PIN_NO_CHANGE,     // Word select pin for microphone (input)
+    .data_out_num = I2S_PIN_NO_CHANGE, // No data output pin needed for recording
+    .data_in_num = 34};  // Data input pin for microphone
 
-// Play LED variables
-int playLedState = LOW;
-int playButtonState;
-int lastPlayButtonState = HIGH;
-bool playModeActive = false;
+// I2S configurations for playback
+i2s_config_t i2s_config_playback = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
+    .sample_rate = sampleRate,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .communication_format = I2S_COMM_FORMAT_I2S_LSB,
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count = 4,
+    .dma_buf_len = bufferSize,
+    .use_apll = true,
+    .tx_desc_auto_clear = false,
+    .fixed_mclk = 0};
+
+i2s_pin_config_t pin_config_playback = {
+    .bck_io_num = 17,    // Bit clock pin for speaker (output)
+    .ws_io_num = I2S_PIN_NO_CHANGE,     // Word select pin for speaker (output)
+    .data_out_num = 16,  // Data output pin for speaker
+    .data_in_num = I2S_PIN_NO_CHANGE}; // No data input pin needed for playback
+
+// Timers
+unsigned long lastCheckTime = 0;
+const unsigned long checkInterval = 60000; // Check for new audio every 60 seconds
+
+bool newAudioAvailable = false;
 
 // Function declarations
-void readerTask(void *param);
-void playerTask(void *param);
-void setupServer();
-
-// ADC and I2S configuration for recording
-i2s_config_t i2s_config_record = {
-  .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX | I2S_MODE_ADC_BUILT_IN),
-  .sample_rate = sampleRate,
-  .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
-  .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
-  .communication_format = I2S_COMM_FORMAT_I2S_LSB,
-  .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-  .dma_buf_count = 4,
-  .dma_buf_len = bufferSize,
-  .use_apll = false,
-  .tx_desc_auto_clear = false,
-  .fixed_mclk = 0
-};
-
-// I2S configuration for playback
-i2s_config_t i2s_config_playback = {
-  .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
-  .sample_rate = sampleRate,
-  .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
-  .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
-  .communication_format = I2S_COMM_FORMAT_I2S_LSB,
-  .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-  .dma_buf_count = 4,
-  .dma_buf_len = bufferSize,
-  .use_apll = true, // Use APLL (Automatic Precision Level Lock) for clock generation
-  .tx_desc_auto_clear = false,
-  .fixed_mclk = 0
-};
-
-// I2S pin configuration for playback
-i2s_pin_config_t pin_config = {
-  .bck_io_num = I2S_PIN_NO_CHANGE,  // No separate clock pin needed
-  .ws_io_num = I2S_PIN_NO_CHANGE,   // No separate word select pin needed
-  .data_out_num = 16,               // Data output pin (SIG)
-  .data_in_num = I2S_PIN_NO_CHANGE  // Not used in playback
-};
+void checkForNewAudio();
+void recordAudio();
+void uploadAudio();
+void downloadAudio();
+void playAudio();
+void handleRecordButton();
+void handlePlayButton();
+void configureI2S(i2s_config_t& config, i2s_pin_config_t& pinConfig);
+void writeWAVHeader(File &file, size_t dataSize);
+size_t getFileSize(const String& filePath);
+void blinkPlayButton();
 
 void setup() {
-  Serial.begin(115200);
-  delay(5000);  // Delay to allow serial connection to stabilize
+    Serial.begin(115200);
+    delay(5000);
 
-  Serial.println("Starting setup...");
+    Serial.println("Setup starting...");
 
-  // Initialize SD card
-  if (!SD.begin(CSPin)) {
-    Serial.println("SD card initialization failed!");
-    while (true) {
-      // Stay here forever as the SD card initialization is critical
-      Serial.println("Please check the SD card and wiring.");
-      delay(5000);
+    // Initialize SD card
+    Serial.print("Initializing SD card on pin ");
+    Serial.println(CSPin);
+    if (!SD.begin(CSPin)) {
+        Serial.println("Failed to initialize SD card. Check connections or try a different SD card.");
+        return;
     }
-  }
-  Serial.println("SD card initialized successfully");
+    Serial.println("SD card initialized successfully.");
 
-  // Wi-Fi connection
-  WiFi.begin(ssid, password);
-  Serial.print("Connecting to Wi-Fi...");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(1000);
-    Serial.print(".");
-  }
-  Serial.println();
-  Serial.println("Connected to Wi-Fi");
-  Serial.print("IP Address: ");
-  Serial.println(WiFi.localIP());
+    // Connect to Wi-Fi
+    Serial.print("Connecting to Wi-Fi network ");
+    Serial.println(ssid);
+    WiFi.begin(ssid, password);
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(1000);
+        Serial.print(".");
+        attempts++;
+        if (attempts > 30) {
+            Serial.println("Failed to connect to Wi-Fi. Please check SSID and password.");
+            return;
+        }
+    }
+    Serial.println("\nConnected to Wi-Fi successfully.");
 
-  // Start the server
-  setupServer();
+    // Install I2S driver for recording
+    Serial.print("Installing I2S driver for recording...");
+    configureI2S(i2s_config_record, pin_config_record);
 
-  // Install and start I2S driver for recording
-  esp_err_t i2s_err = i2s_driver_install(I2S_NUM_0, &i2s_config_record, 0, NULL);
-  if (i2s_err != ESP_OK) {
-    Serial.printf("I2S driver install failed for recording: %d\n", i2s_err);
-    return;
-  }
+    // Pin setup
+    pinMode(recordRedButtonPin, INPUT_PULLUP);
+    pinMode(recordRedLEDPin, OUTPUT);
+    pinMode(playBlueButtonPin, INPUT_PULLUP);
+    pinMode(playBlueLEDPin, OUTPUT);
 
-  // Set I2S ADC mode for recording
-  i2s_set_adc_mode(ADC_UNIT_1, ADC1_CHANNEL_7);
-  i2s_adc_enable(I2S_NUM_0);
-
-  pinMode(recordRedButtonPin, INPUT_PULLUP);
-  pinMode(recordRedLEDPin, OUTPUT);
-  digitalWrite(recordRedLEDPin, recordLedState);
-
-  pinMode(playBlueButtonPin, INPUT_PULLUP);
-  pinMode(playBlueLEDPin, OUTPUT);
-  digitalWrite(playBlueLEDPin, playLedState);
-
-  Serial.println("Setup completed.");
+    Serial.println("Setup completed successfully.");
 }
 
 void loop() {
-  // Handle record button
-  int recordReading = digitalRead(recordRedButtonPin);
-  if (recordReading != lastRecordButtonState) {
-    lastDebounceTime = millis();  // Reset debounce timer
-  }
+    // Handle record button press
+    if (digitalRead(recordRedButtonPin) == LOW) {
+        Serial.println("Record button pressed.");
+        digitalWrite(recordRedLEDPin, HIGH); // Turn on LED
 
-  if ((millis() - lastDebounceTime) > debounceDelay) {
-    if (recordReading != recordButtonState) {
-      recordButtonState = recordReading;
-      if (recordButtonState == LOW && !playModeActive) {  // Record button pressed and play mode is not active
-        if (recordLedState == LOW) {  // Only toggle if record LED is off
-          recordLedState = HIGH;   // Turn on the record LED
-          recordLedOnTime = millis();  // Record time when record LED was turned on
-          Serial.print("Record LED turned ON at ");
-          Serial.print((millis() - recordLedOnTime) / 1000); // Log elapsed seconds
-          Serial.println(" seconds");
-          digitalWrite(recordRedLEDPin, recordLedState);
-
-          // Set modes
-          recordModeActive = true;
-          playModeActive = false; // Ensure play mode is not active
-          digitalWrite(playBlueLEDPin, LOW); // Turn off play LED
-          
-          recording = !recording;
-          if (recording) {
-            Serial.println("Recording started...");
-            if (xTaskCreatePinnedToCore(readerTask, "Reader Task", 12288, NULL, 1, NULL, 0) != pdPASS) {
-              Serial.println("Failed to create reader task");
-              recording = false; // Ensure it doesn't get stuck
-              recordLedState = LOW;
-              digitalWrite(recordRedLEDPin, recordLedState);
+        // Check if file exists and delete it before recording
+        if (SD.exists(recordedFilePath)) {
+            Serial.println("Deleting existing file before recording...");
+            if (!SD.remove(recordedFilePath)) {
+                Serial.println("Error: Failed to delete existing file.");
+                digitalWrite(recordRedLEDPin, LOW); // Turn off LED
+                return;
             }
-          } else {
-            Serial.println("Recording stopped.");
-            delay(1000);
-            recordLedState = LOW;
-            digitalWrite(recordRedLEDPin, recordLedState);
-          }
         }
-      }
+
+        recordAudio();
+        digitalWrite(recordRedLEDPin, LOW); // Turn off LED
     }
-  }
 
-  // Automatically turn off record LED after timeout
-  if (recordLedState == HIGH && (millis() - recordLedOnTime >= recordLedTimeout)) {
-    recordLedState = LOW;
-    digitalWrite(recordRedLEDPin, recordLedState);
-    Serial.print("Record LED turned OFF after ");
-    Serial.print((millis() - recordLedOnTime) / 1000);
-    Serial.println(" seconds");
-
-    // Reset record mode
-    recordModeActive = false;
-    recording = false;
-  }
-
-  lastRecordButtonState = recordReading;  // Save current record button state
-
-  // Handle play button
-  int playReading = digitalRead(playBlueButtonPin);
-  if (playReading != lastPlayButtonState) {
-    lastDebounceTime = millis();  // Reset debounce timer
-  }
-
-  if ((millis() - lastDebounceTime) > debounceDelay) {
-    if (playReading != playButtonState) {
-      playButtonState = playReading;
-      if (playButtonState == LOW && !recordModeActive) {  // Play button pressed and record mode is not active
-        if (playLedState == LOW) {  // Only toggle if play LED is off
-          playLedState = HIGH;   // Turn on the play LED
-          playLedOnTime = millis();  // Record time when play LED was turned on
-          Serial.print("Play LED turned ON at ");
-          Serial.print((millis() - playLedOnTime) / 1000); // Log elapsed seconds
-          Serial.println(" seconds");
-          digitalWrite(playBlueLEDPin, playLedState);
-
-          // Set modes
-          playModeActive = true;
-          recordModeActive = false; // Ensure record mode is not active
-          digitalWrite(recordRedLEDPin, LOW); // Turn off record LED
-          
-          playing = !playing;
-          if (playing) {
-            Serial.println("Playback started...");
-            if (xTaskCreatePinnedToCore(playerTask, "Player Task", 12288, NULL, 1, NULL, 0) != pdPASS) {
-              Serial.println("Failed to create player task");
-              playing = false; // Ensure it doesn't get stuck
-              playLedState = LOW;
-              digitalWrite(playBlueLEDPin, playLedState);
+    // Handle play button press
+    if (digitalRead(playBlueButtonPin) == LOW && newAudioAvailable) {
+        Serial.println("Play button pressed.");
+        digitalWrite(playBlueLEDPin, HIGH); // Turn on LED
+        playAudio();
+        digitalWrite(playBlueLEDPin, LOW); // Turn off LED
+        newAudioAvailable = false; // Reset after playing
+        if (SD.exists(downloadedFilePath)) {
+            if (SD.remove(downloadedFilePath)) {
+                Serial.println("Downloaded audio file deleted after playback.");
+            } else {
+                Serial.println("Error: Failed to delete downloaded audio file after playback.");
             }
-          } else {
-            Serial.println("Playback stopped.");
-            delay(1000);
-            playLedState = LOW;
-            digitalWrite(playBlueLEDPin, playLedState);
-          }
         }
-      }
     }
-  }
 
-  // Automatically turn off play LED after timeout
-  if (playLedState == HIGH && (millis() - playLedOnTime >= playLedTimeout)) {
-    playLedState = LOW;
-    digitalWrite(playBlueLEDPin, playLedState);
-    Serial.print("Play LED turned OFF after ");
-    Serial.print((millis() - playLedOnTime) / 1000); // Log elapsed seconds
-    Serial.println(" seconds");
+    // Periodically check for new audio files
+    if (millis() - lastCheckTime > checkInterval) {
+        lastCheckTime = millis();
+        checkForNewAudio();
+    }
 
-    // Reset play mode
-    playModeActive = false;
-    playing = false;
-  }
+    if (newAudioAvailable) {
+        blinkPlayButton(); // Blink play button if a new audio file is available
+    }
 
-  lastPlayButtonState = playReading;  // Save current play button state
+    delay(1000); // Loop delay
+}
+
+void checkForNewAudio() {
+    Serial.println("Checking for new audio files...");
+
+    WiFiClientSecure client;
+    client.setInsecure(); // Disable SSL certificate verification for simplicity
+
+    HTTPClient http;
+    http.begin(client, serverURL + checkFileURL); // Use the correct endpoint for checking
+
+    int httpResponseCode = http.GET();
+    if (httpResponseCode == 200) {
+        Serial.println("New audio file available, downloading...");
+        downloadAudio();
+        newAudioAvailable = true; // Set flag to indicate new audio is available
+    } else {
+        Serial.printf("Check failed with HTTP response code: %d\n", httpResponseCode);
+    }
+
+    http.end();
+}
+
+void downloadAudio() {
+    Serial.println("Downloading audio...");
+
+    WiFiClientSecure client;
+    client.setInsecure();
+    client.setTimeout(15000);
+
+    HTTPClient http;
+    String downloadURL = serverURL + "/download/device2/uploaded_audio_device2.wav";
+    http.begin(client, downloadURL);
+
+    File audioFile = SD.open(downloadedFilePath, FILE_WRITE);
+    if (!audioFile) {
+        Serial.println("Failed to open file for writing. Check SD card and try again.");
+        return;
+    }
+
+    int httpResponseCode = http.GET();
+    if (httpResponseCode == 200) {
+        WiFiClient *stream = http.getStreamPtr();
+        size_t totalBytesDownloaded = 0;
+        uint8_t buffer[512]; // Adjust buffer size as needed
+        while (stream->available()) {
+            int bytesRead = stream->readBytes(buffer, sizeof(buffer));
+            if (bytesRead > 0) {
+                audioFile.write(buffer, bytesRead);
+                totalBytesDownloaded += bytesRead;
+            }
+        }
+        Serial.printf("Download completed. Total bytes downloaded: %d\n", totalBytesDownloaded);
+
+        // Delete the file from the server
+        http.end();
+        http.begin(client, downloadURL);
+        int deleteResponseCode = http.sendRequest("DELETE");
+        if (deleteResponseCode == 200) {
+            Serial.println("Audio file deleted from server after download.");
+        } else {
+            Serial.printf("Failed to delete file from server, HTTP response code: %d\n", deleteResponseCode);
+        }
+    } else {
+        Serial.printf("Download failed with HTTP response code: %d\n", httpResponseCode);
+    }
+
+    audioFile.close();
+    http.end();
+}
+
+void blinkPlayButton() {
+    static bool ledState = false;
+    ledState = !ledState;
+    digitalWrite(playBlueLEDPin, ledState ? HIGH : LOW);
+}
+
+void playAudio() {
+    Serial.println("Playing audio...");
+
+    File audioFile = SD.open(downloadedFilePath, FILE_READ);
+    if (!audioFile) {
+        Serial.println("Failed to open file for reading. Check SD card and file path.");
+        return;
+    }
+
+    Serial.println("File opened successfully for reading.");
+
+
+    i2s_driver_uninstall(I2S_NUM_0);
+    // Install I2S driver for playback
+    configureI2S(i2s_config_playback, pin_config_playback);
+
+    int16_t buffer[bufferSize];
+    size_t bytesRead;
+    size_t totalBytesPlayed = 0;
+
+    // Skip WAV header
+    audioFile.seek(44); // WAV header is 44 bytes
+
+    while (audioFile.available()) {
+        size_t bytesToRead = audioFile.read((uint8_t *)buffer, sizeof(buffer));
+        esp_err_t i2s_err = i2s_write(I2S_NUM_0, (char *)buffer, bytesToRead, &bytesRead, portMAX_DELAY);
+        if (i2s_err != ESP_OK) {
+            Serial.printf("I2S write failed with error code: %d\n", i2s_err);
+            break;
+        }
+        totalBytesPlayed += bytesRead;
+        Serial.printf("Played %d bytes\n", bytesRead);
+    }
+
+    audioFile.close();
+    Serial.printf("Playback finished. Total bytes played: %d\n", totalBytesPlayed);
+
+    // Uninstall I2S driver after playback
+    i2s_driver_uninstall(I2S_NUM_0);
+}
+
+void recordAudio() {
+    Serial.println("Starting recording...");
+
+    File audioFile = SD.open(recordedFilePath, FILE_WRITE);
+    if (!audioFile) {
+        Serial.println("Failed to open file for writing. Check SD card and try again.");
+        return;
+    }
+
+    Serial.println("File opened successfully for writing.");
+    configureI2S(i2s_config_record, pin_config_record);
+
+    int16_t buffer[bufferSize];
+    size_t bytesRead;
+    size_t totalBytesWritten = 0;
+
+    unsigned long startTime = millis(); // Record start time
+    unsigned long currentTime;
+
+    while (true) {
+        currentTime = millis();
+        if (currentTime - startTime >= 5000) { // Check if 3 seconds have passed
+            Serial.println("3 seconds elapsed, stopping recording.");
+            break; // Exit loop after 3 seconds
+        }
+
+        esp_err_t i2s_err = i2s_read(I2S_NUM_0, (char *)buffer, sizeof(buffer), &bytesRead, portMAX_DELAY);
+        if (i2s_err == ESP_OK) {
+            Serial.printf("Read %d bytes from I2S\n", bytesRead);
+            audioFile.write((uint8_t *)buffer, bytesRead);
+            totalBytesWritten += bytesRead;
+            Serial.printf("Wrote %d bytes to SD card\n", bytesRead);
+        } else {
+            Serial.printf("Error: Failed to read data from I2S, error code: %d\n", i2s_err);
+        }
+    }
+
+    // Update file with correct WAV header
+    size_t dataSize = totalBytesWritten + 36; // Adding 36 bytes for the header
+    audioFile.seek(0); // Move to the beginning of the file
+    writeWAVHeader(audioFile, dataSize);
+
+    audioFile.close();
+    Serial.printf("Recording stopped, file closed. Total recorded bytes: %d\n", totalBytesWritten);
+
+    // Upload the audio file to a server or do further processing
+    uploadAudio();
+}
+
+void uploadAudio() {
+    Serial.println("Uploading audio...");
+
+    WiFiClientSecure client;
+    client.setInsecure();
+    client.setTimeout(15000);
+
+    HTTPClient http;
+    String uploadURL = serverURL + "/upload";
+    http.begin(client, uploadURL);
+
+    http.addHeader("Content-Type", "audio/wav");
+    http.addHeader("User-Agent", "ESP32/1.0");
+    http.addHeader("X-Filename", "uploaded_audio_device1.wav");
+    http.addHeader("X-Device-Type", "device1"); // Specify that this is device1
+
+    File audioFile = SD.open(recordedFilePath, FILE_READ);
+    if (!audioFile) {
+        Serial.println("Failed to open file for reading. Check SD card and file path.");
+        return;
+    }
+
+    size_t fileSize = audioFile.size();
+    if (fileSize == 0) {
+        Serial.println("File is empty, upload aborted.");
+        audioFile.close();
+        return;
+    }
+
+    int httpResponseCode = http.sendRequest("POST", &audioFile, fileSize);
+    Serial.printf("HTTP Response Code: %d\n", httpResponseCode);
+
+    audioFile.close();
+    http.end();
+
+    Serial.println("Upload process finished.");
+}
+
+void configureI2S(i2s_config_t& config, i2s_pin_config_t& pinConfig) {
+    Serial.println("Configuring I2S...");
+
+    // Uninstall I2S driver if already installed
+    if (i2s_driver_install(I2S_NUM_0, &config, 0, NULL) != ESP_ERR_INVALID_STATE) {
+        Serial.println("Uninstalling existing I2S driver...");
+        i2s_driver_uninstall(I2S_NUM_0);
+        delay(500); // Wait for a while to ensure uninstallation
+    }
+    
+    // Try to install I2S driver
+    esp_err_t install_status = i2s_driver_install(I2S_NUM_0, &config, 0, NULL);
+    if (install_status != ESP_OK) {
+        Serial.printf("I2S driver installation failed with error code: %d\n", install_status);
+        return;
+    }
+
+    // Configure I2S pins
+    esp_err_t pin_status = i2s_set_pin(I2S_NUM_0, &pinConfig);
+    if (pin_status != ESP_OK) {
+        Serial.printf("I2S pin configuration failed with error code: %d\n", pin_status);
+    } else {
+        Serial.println("I2S configured successfully.");
+    }
 }
 
 void writeWAVHeader(File &file, uint32_t dataSize) {
-  typedef struct {
-    char chunkID[4];
-    uint32_t chunkSize;
-    char format[4];
-    char subchunk1ID[4];
-    uint32_t subchunk1Size;
-    uint16_t audioFormat;
-    uint16_t numChannels;
-    uint32_t sampleRate;
-    uint32_t byteRate;
-    uint16_t blockAlign;
-    uint16_t bitsPerSample;
-    char subchunk2ID[4];
-    uint32_t subchunk2Size;
-  } WAVHeader;
+    Serial.println("Writing WAV header...");
 
-  WAVHeader header = {
-    {'R', 'I', 'F', 'F'},
-    36 + dataSize,
-    {'W', 'A', 'V', 'E'},
-    {'f', 'm', 't', ' '},
-    16,
-    1,
-    1,
-    sampleRate,
-    sampleRate * 2,
-    2,
-    16,
-    {'d', 'a', 't', 'a'},
-    dataSize
-  };
+    typedef struct
+    {
+        char chunkID[4];        // "RIFF"
+        uint32_t chunkSize;     // 36 + dataSize
+        char format[4];         // "WAVE"
+        char subchunk1ID[4];    // "fmt "
+        uint32_t subchunk1Size; // 16 for PCM
+        uint16_t audioFormat;   // PCM = 1
+        uint16_t numChannels;   // 1 for mono, 2 for stereo
+        uint32_t sampleRate;    // 44100 or other rate
+        uint32_t byteRate;      // sampleRate * numChannels * bitsPerSample / 8
+        uint16_t blockAlign;    // numChannels * bitsPerSample / 8
+        uint16_t bitsPerSample; // 16 for PCM
+        char subchunk2ID[4];    // "data"
+        uint32_t subchunk2Size; // dataSize
+    } WAVHeader;
 
-  file.write((uint8_t *)&header, sizeof(header));
+    WAVHeader header = {
+        {'R', 'I', 'F', 'F'},       // Chunk ID
+        36 + dataSize,              // Chunk Size
+        {'W', 'A', 'V', 'E'},       // Format
+        {'f', 'm', 't', ' '},       // Subchunk 1 ID
+        16,                         // Subchunk 1 Size (16 for PCM)
+        1,                          // Audio Format (1 for PCM)
+        1,                          // Number of Channels (1 for mono, 2 for stereo)
+        sampleRate,                 // Sample Rate
+        sampleRate * 2,             // Byte Rate (SampleRate * NumChannels * BitsPerSample / 8)
+        2,                          // Block Align (NumChannels * BitsPerSample / 8)
+        16,                         // Bits Per Sample
+        {'d', 'a', 't', 'a'},       // Subchunk 2 ID
+        dataSize                    // Subchunk 2 Size
+    };
+
+    file.write((uint8_t *)&header, sizeof(header));
+
+    Serial.println("WAV header written successfully.");
 }
 
-void readerTask(void *param) {
-  Serial.println("Reader task started");
-
-  if (SD.exists("/recording.wav")) {
-    SD.remove("/recording.wav");
-  }
-
-  File audioFile = SD.open("/recording.wav", FILE_WRITE);
-  if (!audioFile) {
-    Serial.println("Failed to open file for writing on SD card");
-    vTaskDelete(NULL);
-    return;
-  }
-
-  Serial.println("File opened successfully for writing");
-
-  size_t totalDataSize = 0;
-
-  // Write a placeholder WAV header with zero data size
-  writeWAVHeader(audioFile, 0);
-
-  while (recording) {
-    int16_t buffer[bufferSize];
-    size_t bytesRead;
-    esp_err_t i2s_err = i2s_read(I2S_NUM_0, (char *)buffer, sizeof(buffer), &bytesRead, portMAX_DELAY);
-    if (i2s_err != ESP_OK) {
-      Serial.printf("I2S read failed: %d\n", i2s_err);
-      break;
+size_t getFileSize(const String& filePath) {
+    File file = SD.open(filePath, FILE_READ);
+    if (!file) {
+        Serial.println("Failed to open file for size check. Check SD card and file path.");
+        return 0;
     }
-
-    audioFile.write((uint8_t *)buffer, bytesRead);
-    totalDataSize += bytesRead;
-
-    // Debugging information
-    Serial.printf("Bytes read: %zu, Total data size: %zu\n", bytesRead, totalDataSize);
-
-    // Check if SD card is almost full
-    if (SD.cardSize() - SD.usedBytes() < bufferSize) {
-      Serial.println("Warning: SD card is almost full!");
-      break;
-    }
-  }
-
-  // Ensure the totalDataSize is valid before writing it to header
-  if (totalDataSize > 0) {
-    audioFile.seek(4); // Move to chunk size position
-    uint32_t fileSize = totalDataSize + 36;
-    audioFile.write((uint8_t *)&fileSize, sizeof(fileSize));
-
-    audioFile.seek(40); // Move to data chunk size position
-    audioFile.write((uint8_t *)&totalDataSize, sizeof(totalDataSize));
-  } else {
-    Serial.println("No data recorded, WAV file will not be updated.");
-  }
-
-  audioFile.close();
-  Serial.println("Recording stopped, file closed");
-  vTaskDelete(NULL);
-}
-
-void playerTask(void *param) {
-  Serial.println("Player task started");
-
-  // Uninstall I2S driver if it is already installed
-  i2s_driver_uninstall(I2S_NUM_0);
-
-  // Install and start I2S driver for playback
-  esp_err_t i2s_err = i2s_driver_install(I2S_NUM_0, &i2s_config_playback, 0, NULL);
-  if (i2s_err != ESP_OK) {
-    Serial.printf("I2S driver install failed for playback: %d\n", i2s_err);
-    vTaskDelete(NULL);
-    return;
-  }
-
-  // Set I2S pin configuration
-  i2s_err = i2s_set_pin(I2S_NUM_0, &pin_config);
-  if (i2s_err != ESP_OK) {
-    Serial.printf("I2S set pin failed: %d\n", i2s_err);
-    vTaskDelete(NULL);
-    return;
-  }
-
-  i2s_zero_dma_buffer(I2S_NUM_0);
-
-  File audioFile = SD.open("/recording.wav", FILE_READ);
-  if (!audioFile) {
-    Serial.println("Failed to open file for reading on SD card");
-    vTaskDelete(NULL);
-    return;
-  }
-
-  Serial.println("File opened successfully for reading");
-
-  audioFile.seek(44); // Skip WAV header
-
-  while (playing) {
-    int16_t buffer[bufferSize];
-    size_t bytesRead = audioFile.read((uint8_t *)buffer, sizeof(buffer));
-    if (bytesRead == 0) {
-      Serial.println("End of file reached");
-      break;
-    }
-
-    size_t bytesWritten;
-    esp_err_t i2s_err = i2s_write(I2S_NUM_0, (char *)buffer, bytesRead, &bytesWritten, portMAX_DELAY);
-    if (i2s_err != ESP_OK) {
-      Serial.printf("I2S write failed: %d\n", i2s_err);
-      break;
-    }
-  }
-
-  audioFile.close();
-  Serial.println("Playback stopped, file closed");
-  vTaskDelete(NULL);
-}
-
-void setupServer() {
-  // Route to serve the file
-  server.on("/recording", HTTP_GET, [](AsyncWebServerRequest *request){
-    request->send(SD, "/recording.wav", "audio/wav");
-  });
-
-  // Start server
-  server.begin();
+    size_t size = file.size();
+    file.close();
+    return size;
 }
